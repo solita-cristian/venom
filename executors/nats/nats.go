@@ -11,6 +11,18 @@ import (
 
 const Name = "nats"
 
+const (
+	defaultUrl            = "nats://localhost:4222"
+	defaultConnectTimeout = 5 * time.Second
+	defaultReconnectTime  = 1 * time.Second
+	defaultClientName     = "Venom"
+)
+
+const (
+	defaultMessageLimit = 1
+	defaultDeadline     = 5
+)
+
 type Executor struct {
 	Command      string              `json:"command,omitempty" yaml:"command,omitempty"`
 	Url          string              `json:"url,omitempty" yaml:"url,omitempty"`
@@ -19,12 +31,14 @@ type Executor struct {
 	Header       map[string][]string `json:"header,omitempty" yaml:"header,omitempty"`
 	MessageLimit int                 `json:"message_limit,omitempty" yaml:"messageLimit,omitempty"`
 	Deadline     int                 `json:"deadline,omitempty" yaml:"deadline,omitempty"`
+	ReplySubject string              `json:"reply_subject,omitempty" yaml:"replySubject,omitempty"`
 }
 
 type Message struct {
-	Data    interface{}         `json:"data,omitempty" yaml:"data,omitempty"`
-	Header  map[string][]string `json:"header,omitempty" yaml:"header,omitempty"`
-	Subject string              `json:"subject,omitempty" yaml:"subject,omitempty"`
+	Data         interface{}         `json:"data,omitempty" yaml:"data,omitempty"`
+	Header       map[string][]string `json:"header,omitempty" yaml:"header,omitempty"`
+	Subject      string              `json:"subject,omitempty" yaml:"subject,omitempty"`
+	ReplySubject string              `json:"reply_subject,omitempty" yaml:"replySubject,omitempty"`
 }
 
 type Result struct {
@@ -49,7 +63,7 @@ func (Executor) Run(ctx context.Context, step venom.TestStep) (interface{}, erro
 	var cmdErr error
 	switch e.Command {
 	case "publish":
-		cmdErr = e.publish(ctx, session)
+		_, cmdErr = e.publish(ctx, session, false)
 		if cmdErr != nil {
 			result.Error = cmdErr.Error()
 		}
@@ -60,21 +74,25 @@ func (Executor) Run(ctx context.Context, step venom.TestStep) (interface{}, erro
 		} else {
 			result.Messages = msgs
 		}
+	case "request":
+		reply, cmdErr := e.publish(ctx, session, true)
+		if cmdErr != nil {
+			result.Error = cmdErr.Error()
+		} else {
+			result.Messages = []Message{*reply}
+			venom.Debug(ctx, "Received reply message %+v", result.Messages)
+		}
 	}
 
 	return result, nil
 }
 
 func New() venom.Executor {
-	return &Executor{}
+	return &Executor{
+		MessageLimit: defaultMessageLimit,
+		Deadline:     defaultDeadline,
+	}
 }
-
-const (
-	defaultUrl           = "nats://localhost:4222"
-	defaultTimeout       = 5 * time.Second
-	defaultReconnectTime = 1 * time.Second
-	defaultClientName    = "Venom"
-)
 
 func (e Executor) session(ctx context.Context) (*nats.Conn, error) {
 	if e.Url == "" {
@@ -83,7 +101,7 @@ func (e Executor) session(ctx context.Context) (*nats.Conn, error) {
 	}
 
 	opts := []nats.Option{
-		nats.Timeout(defaultTimeout),
+		nats.Timeout(defaultConnectTimeout),
 		nats.Name(defaultClientName),
 		nats.MaxReconnects(-1),
 		nats.ReconnectWait(defaultReconnectTime),
@@ -101,9 +119,9 @@ func (e Executor) session(ctx context.Context) (*nats.Conn, error) {
 	return nc, nil
 }
 
-func (e Executor) publish(ctx context.Context, session *nats.Conn) error {
+func (e Executor) publish(ctx context.Context, session *nats.Conn, isRequest bool) (*Message, error) {
 	if e.Subject == "" {
-		return fmt.Errorf("subject is required")
+		return nil, fmt.Errorf("subject is required")
 	}
 
 	venom.Debug(ctx, "Publishing message to subject %q with payload %q", e.Subject, e.Payload)
@@ -114,29 +132,39 @@ func (e Executor) publish(ctx context.Context, session *nats.Conn) error {
 		Header:  e.Header,
 	}
 
-	err := session.PublishMsg(&msg)
-	if err != nil {
-		return err
+	var result Message
+	if isRequest {
+		if e.ReplySubject == "" {
+			return nil, fmt.Errorf("reply subject is required for request command")
+		}
+		msg.Reply = e.ReplySubject
+
+		replyMsg, err := session.RequestMsg(&msg, time.Duration(5)*time.Second)
+		if err != nil {
+			return nil, err
+		}
+
+		result = Message{
+			Data:         string(replyMsg.Data),
+			Header:       replyMsg.Header,
+			Subject:      msg.Subject,
+			ReplySubject: replyMsg.Subject,
+		}
+	} else {
+		err := session.PublishMsg(&msg)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	venom.Debug(ctx, "Message published to subject %q", e.Subject)
 
-	return nil
+	return &result, nil
 }
 
 func (e Executor) subscribe(ctx context.Context, session *nats.Conn) ([]Message, error) {
 	if e.Subject == "" {
 		return nil, fmt.Errorf("subject is required")
-	}
-
-	if e.MessageLimit == 0 {
-		venom.Warning(ctx, "No max messages provided, using default 1")
-		e.MessageLimit = 1
-	}
-
-	if e.Deadline == 0 {
-		venom.Warning(ctx, "No timeout provided, using default 5 seconds")
-		e.Deadline = 5
 	}
 
 	venom.Debug(ctx, "Subscribing to subject %q", e.Subject)
